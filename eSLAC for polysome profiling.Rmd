@@ -1,0 +1,1261 @@
+
+#Install Required Packages Efficiently
+```{r}
+# This chunk ensures all required packages are installed before use.
+
+# List of required packages
+required_packages <- c("tidyverse", "ggplot2", "purrr", "readxl", "foreach", "doParallel")
+
+# Identify missing packages
+missing_packages <- required_packages[!(required_packages %in% installed.packages()[,"Package"])]
+
+# Install only missing packages
+if(length(missing_packages) > 0) {
+  install.packages(missing_packages)
+} else {
+  message("All required packages are already installed.")
+}
+```
+# === Setup Environment ===
+```{r}
+# === Setup Environment ===
+
+# Remove all objects from the current R environment to start fresh
+rm(list = ls())
+
+# Perform garbage collection to free up memory
+gc()
+
+# Define the list of sample numbers to process
+samplenumlist <- c(2:2)  # Currently only includes sample number 2
+
+# === Filtering Settings ===
+
+# Set the mutation deletion limit for filtering
+mutdellim <- 5
+
+# Define a list of specific isoacceptors to exclude from analysis
+# Previously, there were more excluded isoacceptors, but now only two remain
+exclude_isoaccep <- list("Ile-GAT-1", "Tyr-ATA-1")
+
+# === Define Experimental Variables ===
+
+# Labels for different experimental conditions (modify as needed)
+var1 = "(1)Inp_noBS"
+var2 = "(2)poly_noBS"
+var3 = "(3)Inp_+BS"
+var4 = "(4)poly_+BS"
+
+# === Define File Paths (Modify if Needed) ===
+
+# Base directory for data storage
+path1 = "/project/taopan/mahdi/jupyter_R"
+
+# Specific subdirectories for polysome analysis
+path2 = "/Chenyou_polysome2024_2025"
+path3 = "/5_tsv"
+path4 = "/Chenyou_polysome2024_2025\\sinmol"
+path5 = "/hg38_tRNA_HC_intro_removed_CCA_upper_case"
+path6 = "/Chenyou_polysome2024_2025\\sinmol"
+
+# Paths for reference RNA modifications data
+# path7 = "C:\\Users\\mahdiassari\\Box\\1 UChicago ;))))))\\1. Ph.D. Project\\Data analysis\\important ref rna modifications\\tRNA\\mito_tRNA_complete_onlymod.xlsx"
+path8 = "/project/taopan/mahdi/jupyter_R/all_tRNA_seq_numbering_MA_20250122.xlsx"
+
+# Project name
+projname = "Chenyou_polysome2024_2025"
+
+# Construct the full path for SinMol TSV data
+PATH_SinMol_tsv = paste0(path1, path6)
+
+# === Define Output Directories ===
+
+# Directory for storing plots
+output_dir <- paste0(PATH_SinMol_tsv, "/plots")
+
+# Directory for storing generated dataframes
+generated_dataframes <- paste0(PATH_SinMol_tsv, "/generated_dataframes")
+
+# Create the output directory if it doesn't already exist (prevents errors)
+dir.create(generated_dataframes, showWarnings = FALSE)
+
+# === Define Specific Amino Acids and Anticodons of Interest ===
+
+# Initialize an empty vector (to be filled later)
+AA_anticodon_N1_N2_ofInt = c()
+
+# Define the amino acid-anticodon pairs of interest
+AA_anticodonofInt = c("Arg-TCT", "Asp-GTC", "Glu-CTC", "Glu-TTC", "Lys-TTT")
+
+```
+# === Import Required Libraries ===
+```{r}
+# These libraries support plotting, data manipulation, and parallelization.
+
+library(ggplot2)      # Data visualization
+library(scales)       # Scaling functions for ggplot
+library(reshape2)     # Reshaping data (melt, cast)
+library(tidyr)        # Data tidying
+library(dplyr)        # Data manipulation (must be loaded after tidyr)
+library(grid)         # Low-level graphical functions
+library(gridExtra)    # Arranging multiple grid-based plots
+library(ggpubr)       # Publication-ready plots
+library(cowplot)      # Advanced plot arrangements
+library(ggrepel)      # Avoid overlapping text labels in ggplot
+library(stringr)      # String manipulation
+library(tidyselect)   # Selecting columns programmatically
+library(purrr)        # Functional programming tools
+library(readxl)       # Reading Excel files
+library(stats)        # Basic statistical functions
+library(foreach)      # Iteration over elements (parallel processing)
+library(doParallel)   # Parallel backend for foreach
+library(parallel)     # Parallel computing utilities
+library(data.table)   # Fast and efficient data handling
+
+# === Load Modification Table from Excel File ===
+modtable <- read_excel(path8)  # Read Excel file with modification information
+
+# Data cleaning & transformation
+modtable <- modtable %>% 
+  select(1:103) %>%
+  mutate_at(vars(2:103), ~na_if(., "-")) %>%
+  mutate_at(vars(2:103), ~na_if(., ".")) %>%
+  mutate_at(vars(2:103), ~gsub("[tU]", "T", .)) %>%
+  mutate_at(vars(2:103), ~gsub("g", "G", .)) %>%
+  mutate_at(vars(2:103), ~gsub("c", "C", .)) #%>% 
+
+# Extract amino acid and anticodon information
+modtable <- modtable %>%
+  mutate(AA_anticodon_N1 = AA) %>%  # Store original AA column
+  separate(AA, c("AA", "anticodon", "N1"), sep = "-", remove = TRUE) %>%  # Split column into components
+  mutate(AA_anticodon = paste(AA, anticodon, sep = "-"))  # Create combined AA-anticodon variable
+
+# === Load Data Files ===
+FILES <- data.frame(file_name = list.files(PATH_SinMol_tsv))  # List files in directory
+
+# Process filenames
+FILES <- FILES %>%
+  filter(grepl(".tsv", file_name),  # Keep only TSV files
+         !grepl("unassigned", file_name)) %>%  # Exclude 'unassigned' files
+  extract(file_name, "(.*).tsv", into="file_name2", remove=FALSE) %>%  # Extract filename without extension
+  separate(file_name2, remove=TRUE, sep="_", c("junk0", "junk2","sample","junk3", "junk4","bc","junk5","binstart","binstop")) %>%  # Split filename into parts
+  select(file_name, sample, bc, binstart, binstop)  # Keep relevant columns
+
+# Rename samples based on barcodes
+FILES <- FILES %>%
+  mutate(
+    sample = case_when(
+      sample == "S5" & (bc == "bc5" | bc == "bc10") ~ paste(var1),
+      sample == "S5" & (bc == "bc8" | bc == "bc9") ~ paste(var2),
+      sample == "S4" & (bc == "bc5" | bc == "bc10") ~ paste(var3),
+      sample == "S4" & (bc == "bc8" | bc == "bc9") ~ paste(var4),
+      TRUE ~ sample  # Keep original sample name if no match
+    )
+  ) %>%
+  filter(sample != FILES$sample)  # Remove unchanged sample names
+
+# === Modify Bin Values ===
+FILES <- FILES %>%
+  mutate(binstart = ifelse(is.na(binstart), -3, binstart),  # Default binstart to -3 if missing
+         binstop = ifelse(is.na(binstop), -3, binstop))  # Default binstop to -3 if missing
+
+# === Set Global Plot Theme ===
+theme_set(
+  theme_bw() + 
+  theme(
+    legend.position = "bottom", 
+    text = element_text(family = "Arial", size = 14),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(color = "black")
+  )
+)
+
+# Define a negation function for filtering
+`%nin%` = Negate(`%in%`)i
+
+# Create an empty ggplot object for visualization placeholders
+empty_graph <- ggplot() + theme_void()
+
+# Run garbage collection to free up memory
+gc()i
+```
+# === ULTIMATE_crosstalk_allSamples ===
+```{r}
+# Processing large TSV files efficiently with parallelization
+
+# Start timing
+start_time <- Sys.time()
+print(paste("Start time:", start_time))
+
+# Initialize an empty data frame to store results
+allsamples_outdf_all_genes <- data.frame(
+    sample = character(),
+    rep = character(),
+    AA_anticodon = character(),
+    mod_pos1 = character(),
+    mod1 = character(),
+    mod_pos2 = character(),
+    mod2 = character(),
+    O_O = numeric(), 
+    O_l = numeric(), 
+    l_O = numeric(), 
+    l_l = numeric(), 
+    odds_ratio = numeric(),
+    pval = numeric(),
+    mut_percentage_pos1 = numeric(),
+    del_percentage_pos1 = numeric(),
+    mut_percentage_pos2 = numeric(),
+    del_percentage_pos2 = numeric(),
+    stringsAsFactors = FALSE
+)
+
+# === Filter FILES Based on Sample Number ===
+FILES_oneS <- FILES %>%
+  filter(substr(sample, 2, 2) %in% samplenumlist)  # Keep only relevant sample numbers
+
+# Convert to a data.table for efficiency
+FILES_oneS <- as.data.table(FILES_oneS)
+
+# Define columns to retain from TSV files
+selected_columns <- c("read_id", "gene", "position", "base", "deletion", "mutation", "insertion")
+
+# === Set Up Parallel Processing ===
+num_cores <- detectCores() - 2  # Leave 2 cores free
+cl <- makeCluster(num_cores)  # Create a cluster
+registerDoParallel(cl)  # Register for parallel execution
+
+# === Define Function to Read One File Efficiently ===
+read_in_one <- function(row, path, selected_columns) {
+  file_path <- file.path(path, row$file_name)  # Construct full file path
+  output <- fread(file_path, sep = '\t')  # Read TSV file using data.table
+  output <- output[, ..selected_columns]  # Keep only selected columns
+  output[, `:=`(sample = row$sample, bc = row$bc)]  # Add sample and barcode info
+  return(output)
+}
+
+# === Read Files in Parallel ===
+results <- foreach(
+  row = iter(FILES_oneS, by = "row"),
+  .packages = c('data.table'),
+  .export = c('selected_columns')  # Export selected_columns to each parallel worker
+) %dopar% {
+  read_in_one(row, PATH_SinMol_tsv, selected_columns)
+}
+
+# Combine results into a single data.table
+hg38_tRNA_SM <- rbindlist(results)
+rm(results)
+gc()
+
+# End timing
+end_time <- Sys.time()
+print(paste("End time:", end_time))
+duration <- end_time - start_time
+print(paste("Duration:", duration))
+gc()
+
+# Close parallel cluster
+stopCluster(cl)
+
+# === Data Cleaning & Filtering ===
+hg38_tRNA_SM <- hg38_tRNA_SM[gene %nin% c(
+    "NR_004394.1", "NR_002716.3", "NR_003925.1",
+    "NR_004430.2", "NR_002756.2", "NR_004391.1",
+    "NR_004392.1", "NR_004393.1", "NR_001571.2",
+    "Homo_sapiens_chrX.rRNA-5SR5SR", "Homo_sapiens_chrX.rRNA-58S58S",
+    "Ecoli_Tyr", "Yeast_Phe", "Ecoli_Lys",
+    "spikein_SCC1", "spikein_SCCA1", "spikein_SCCA2", "spikein_SCCA3"
+  ) & insertion == 0]
+
+# === Format Gene Names ===
+hg38_tRNA_SM[, gene := str_remove(gene, "^Homo_sapiens_tRNA-")]  # Step 1: Remove prefix if it exists
+hg38_tRNA_SM[, gene := ifelse(!str_detect(gene, "-"), 
+                              str_replace(gene, "(...$)", "-\\1"), 
+                              gene)]  # Step 2: Add '-' before last 3 characters if missing
+
+```
+
+# === Filter Data Based on Amino Acid-Anticodon of Interest ===
+```{r}
+# === Filter Data Based on Amino Acid-Anticodon of Interest ===
+hg38_tRNA_SM <- hg38_tRNA_SM %>% 
+  {if(length(AA_anticodonofInt) > 0)
+    filter(., substr(gene, 1, 7) %in% AA_anticodonofInt)
+    else
+      .
+  }
+
+# === Assign Source Type (Mitochondrial or Cytosolic) ===
+hg38_tRNA_SM[, source := ifelse(substr(gene, 1, 2) == "mt", "mitochondrial", "cytosolic")]
+
+# === Filter Data Based on AA-Anticodon N1/N2 Selection (if specified) ===
+if (length(AA_anticodon_N1_N2_ofInt) > 0) {
+  hg38_tRNA_SM <- hg38_tRNA_SM[AA_anticodon_N1_N2 %in% AA_anticodon_N1_N2_ofInt]
+}
+
+# Rename 'bc' to 'rep' (biological replicate identifier)
+setnames(hg38_tRNA_SM, "bc", "rep")
+
+# === Select Relevant Columns ===
+hg38_tRNA_SM <- hg38_tRNA_SM[, .(read_id, sample, rep, source, gene, position, base, mutation, deletion)]
+gc()
+
+# === Order Data by Read ID and Position ===
+hg38_tRNA_SM <- hg38_tRNA_SM[order(-position), .SD, by = read_id]
+
+# === Compute Additional Read-Based Metrics ===
+hg38_tRNA_SM[, read_size_nt := .N, by = read_id]  # Count nucleotides per read
+hg38_tRNA_SM[, top3_bases := paste0(base[1], base[2], base[3]), by = read_id]  # Extract top 3 bases
+
+# === Assign Charging Values ===
+hg38_tRNA_SM[, charging := fcase(
+  grepl("^CC[ATCG]$", top3_bases), -1,  # Uncharged (-1) if top3_bases starts with "CC"
+  top3_bases == "ACC", 1,  # Charged (+1) if exact match "ACC"
+  default = NA  # Otherwise, NA
+)]
+
+# Remove top3_bases column (no longer needed)
+hg38_tRNA_SM[, top3_bases := NULL]
+
+gc()
+
+# === Save Processed Data ===
+saveRDS(hg38_tRNA_SM, file = paste0(PATH_SinMol_tsv, 
+  "\\generated_dataframes\\", projname, "_hg38_tRNA_SM_cytoandmito_sample_", 
+  "_Date_", Sys.Date(), ".rds"))
+
+# === Create tRNA Count Dataframe ===
+
+# Extract first occurrence of each read_id per position
+temp_count <- hg38_tRNA_SM[order(position), .(position = first(position)), by = .(sample, rep, gene, read_id, source)]
+
+# Compute various counts and percentages for tRNA genes
+temp_count[, tRNA_gene_count_per_rep := .N, by = .(sample, rep, gene)]
+temp_count[, tRNA_gene_count_all_rep := .N, by = .(sample, gene)]
+temp_count[, tRNA_gene_count_per_rep_total := .N, by = .(sample, rep, source)]
+temp_count[, tRNA_gene_percent_per_rep := tRNA_gene_count_per_rep / tRNA_gene_count_per_rep_total * 100]
+temp_count[, tRNA_gene_count_all_rep_total := .N, by = .(sample, source)]
+temp_count[, tRNA_gene_percent_all_rep := tRNA_gene_count_all_rep / tRNA_gene_count_all_rep_total * 100]
+temp_count[, allcount_per_source := .N, by = source]
+temp_count[, tRNA_gene_count := .N, by = gene]
+temp_count[, tRNA_gene_count_isodecod_per := tRNA_gene_count / allcount_per_source]
+
+gc()
+
+# === Merge Count Dataframe with Processed Data ===
+temp_ordered_count <- copy(temp_count)[hg38_tRNA_SM, on = .(sample, rep, gene, source, read_id, position)]
+
+# Remove temporary dataframes and free memory
+rm(hg38_tRNA_SM, temp_count)
+gc()
+
+
+```
+# === Separate the Gene Column into Components ===
+```{r}
+# === Separate the Gene Column into Components ===
+temp_ordered_count[, c("AA", "anticodon", "N1", "N2") := tstrsplit(gene, "-", fixed=TRUE)]
+gc()
+
+# === Order Data for Easier Processing ===
+temp_ordered_count <- temp_ordered_count[order(gene, sample, rep, position)]
+
+# === Create New Combined Columns ===
+temp_ordered_count[, AA_anticodon := paste0(AA, "-", anticodon)]  # Combine AA and anticodon
+temp_ordered_count[, AA_anticodon_N1 := paste0(AA_anticodon, "-", N1)]  # Add N1 information
+
+
+saveRDS(temp_ordered_count, file = paste0(PATH_SinMol_tsv, 
+  "\\generated_dataframes\\", projname, "_temp_ordered_count_", 
+  "_Date_", Sys.Date(), ".rds"))
+
+
+# === Filter Data Based on Amino Acid-Anticodon Interest (If Needed) ===
+temp_ordered_count <- temp_ordered_count %>% 
+  {if(length(AA_anticodonofInt) > 0)
+    filter(., AA_anticodon %in% AA_anticodonofInt)
+    else
+      .
+  }
+gc()
+saveRDS(temp_ordered_count, file = paste0(PATH_SinMol_tsv, 
+  "/generated_dataframes/", projname, "_temp_ordered_count_fraction_", 
+  "_Date_", Sys.Date(), ".rds"))
+
+print(unique(temp_ordered_count$AA_anticodon))
+
+# === Remove Unnecessary Columns to Free Memory ===
+temp_ordered_count[, c("N1", "N2", "gene", "anticodon") := NULL]
+
+```
+# === Polysome Charging Analysis ===
+```{r}
+# === Polysome Charging Analysis ===
+# Checking the type of `temp_ordered_count`
+typeof(temp_ordered_count)
+
+# === Sort Data by Position in Descending Order ===
+setorder(temp_ordered_count, -position)
+
+# === Extract Top 3 Bases for Each Read ===
+temp_ordered_count[, top3_bases := paste0(base[1], base[2], base[3]), by = read_id]
+
+# === Assign Charging States ===
+temp_ordered_count[, charging := fcase(
+  grepl("^CC[ATCG]$", top3_bases), -1,  # Uncharged (-1) if starts with "CC"
+  top3_bases == "ACC", 1,  # Charged (+1) if exactly "ACC"
+  default = NA  # Otherwise, NA
+)]
+
+# Free up memory
+gc()
+
+# Remove the `top3_bases` column as it is no longer needed
+temp_ordered_count[, top3_bases := NULL]
+
+# === Extract First Occurrence of Position per Read ===
+read_id_temp_ordered_count <- temp_ordered_count[order(position), .(position = first(position)), 
+    by = .(read_id, AA_anticodon, charging, read_size_nt, sample, rep)] %>% 
+    filter(read_size_nt >= 60)
+
+# === Count Charged, Uncharged, and NA Reads ===
+charged_n <- read_id_temp_ordered_count[charging == 1, .N]
+uncharged_n <- read_id_temp_ordered_count[charging == -1, .N]
+NAcharged_n <- read_id_temp_ordered_count[charging %nin% c(1, -1), .N]
+print(paste0(charged_n, "\n", uncharged_n, "\n", NAcharged_n))
+
+# === Compute Charging Ratios ===
+temp <- read_id_temp_ordered_count[charging %in% c(1, -1),
+    .(charged_read_id = sum(charging == 1),
+      uncharged_read_id = sum(charging == -1),
+      charging_ratio = fifelse(sum(charging == -1) > 0,
+                                sum(charging == 1) / sum(charging == -1), 
+                                NA_real_)
+    ),
+    by = .(AA_anticodon, sample, rep)]
+
+# === Define Visualization Parameters ===
+group1 <- "2"
+maxy <- 100
+interest <- "charging_ratio"
+
+# Arrange `temp` dataset for better visualization
+temp <- temp %>% arrange(desc(as.numeric(str_sub(sample,2,2)))) %>% arrange(AA_anticodon)
+
+# === Define Custom Colors and Labels Dynamically ===
+custom_colors <- c(group1 = "red")
+names(custom_colors) <- c(group1)
+
+custom_labels <- c(group1 = paste0(get(paste0("var", as.numeric(group1)))))
+names(custom_labels) <- c(group1)
+
+# === Generate Column Plot ===
+p <- ggplot(temp, aes(x = AA_anticodon, y = !!sym(interest), fill = str_sub(sample, 2, 2))) +
+  geom_col(position = position_dodge(), width = 0.7) +
+  geom_text(aes(label = paste0(sprintf("%.1f", charged_read_id), " charged")),
+            size = 3,
+            position = position_dodge(width = 0.9),
+            hjust = -0.1,
+            angle = 90) +
+  labs(x = "AA_anticodon", y = interest, 
+       title = paste0(interest, " Sample", group1), 
+       fill = "Sample Group") +
+  theme_minimal() +
+  theme(
+        plot.background = element_rect(fill = "white", color = "white"),
+        panel.background = element_rect(fill = "white", color = "white"),
+        panel.grid.major = element_line(color = "white"),
+        panel.grid.minor = element_line(color = "white"),
+        panel.grid.major.y = element_line(color = "grey90"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 10),
+        axis.text.y = element_text(size = 15),
+        panel.border = element_rect(color = "lightgrey", fill = NA, size = 0.5)
+      ) + 
+  scale_fill_manual(values = custom_colors, labels = custom_labels)
+
+# === Save the Plot ===
+file_name <- paste0("tRNA_", interest, "_", group1, "_samplegroups", sourc, "_AVG_FL", "_maxy = ", maxy, projname, "_", Sys.Date(), ".png") 
+file_path <- file.path(output_dir, file_name)
+ggsave(file_path, plot = p, width = 14, height = 10)
+
+```
+# === CONT.3: Processing tRNA Mutations and Charging Status ===
+```{r}
+# === Create the output directory if it doesn’t exist ===
+dir.create(output_dir, showWarnings = FALSE)
+
+# === Filter Data: Select the first occurrence of each read_id per position ===
+filtered_data_AA <- temp_ordered_count[order(position), .SD[1], by = read_id, 
+                                      .SDcols = setdiff(names(temp_ordered_count), "read_id")]
+
+# === Select the first occurrence per sample, rep, and AA_anticodon_N1 ===
+filtered_data_AA <- filtered_data_AA[, .SD[1], by = .(sample, rep, AA_anticodon_N1)]
+
+# === Function to Create Abundance Plots for tRNA Genes ===
+create_plots_abundant <- function(filtered_data, output_dir) {
+    # Extract unique amino acids
+    unique_crosstalk <- unique(filtered_data$AA)
+    # Split into chunks of 16 for easier visualization
+    crosstalk_chunks <- split(unique_crosstalk, ceiling(seq_along(unique_crosstalk) / 16))
+    
+    for (chunk_index in seq_along(crosstalk_chunks)) {
+        chunk <- crosstalk_chunks[[chunk_index]]
+        chunk_data <- filtered_data[AA %in% chunk]
+
+        # === Generate Scatter Plot ===
+        p <- ggplot(chunk_data, aes(x = AA_anticodon, y = tRNA_gene_percent_per_rep, 
+                                    color = rep, fill = NA, shape = as.factor(sample))) +
+            geom_point(alpha = 0.5, stroke = 1.5, size = 1) +  # Scatter points
+            geom_text_repel(aes(label = paste0(rep, "-", AA_anticodon)),  # Add labels
+                            size = 1, max.overlaps = 100) +
+            labs(title = "Most Abundant tRNA Genes", x = "", y = "tRNA Percentage",
+                 color = "Rep", shape = "Sample") +
+            theme_minimal() +
+            theme(
+                plot.background = element_rect(fill = "white", color = "white"),
+                panel.background = element_rect(fill = "white", color = "white"),
+                panel.grid.major = element_line(color = "grey90"),
+                panel.grid.minor.y = element_line(color = "grey90"),
+                axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 5),
+                axis.text.y = element_text(size = 10),
+                axis.title.y = element_text(size = 20),
+                panel.border = element_rect(color = "lightgrey", fill = NA, linewidth = 0.5),
+                strip.text = element_text(size = 20)
+            ) + 
+            facet_wrap(~AA, scales = "free")  # Create separate facets for each amino acid
+        
+        # === Save the Plot ===
+        file_name <- paste0("AA_abundance_sample_S", "_", chunk_index, "_", Sys.Date(), ".png")
+        file_path <- file.path(output_dir, file_name)
+        ggsave(file_path, plot = p, width = 14, height = 10)
+    }
+}
+
+# === Generate Plots ===
+create_plots_abundant(filtered_data_AA, output_dir)
+
+# === Load Most Abundant Isodecoders from RDS File ===
+most_abun_isodecod_list <- readRDS(paste0(path1, "\\MA-13-5-SinMol_tsvfiles", 
+                                          "\\generated_dataframes\\", 
+                                          "MA-13-56_PUSKO_BID", 
+                                          "most_abun_isodecod_list-_cytoandmito_2024-12-17.rds"))
+
+# === Remove Excluded Isoacceptors from the List ===
+most_abun_isodecod_list <- setdiff(unlist(most_abun_isodecod_list), unlist(exclude_isoaccep))
+
+# === Filter Data for Most Abundant Isoacceptors ===
+temp_ordered_count <- temp_ordered_count[AA_anticodon_N1 %in% most_abun_isodecod_list]
+
+# === Initialize Output Data Frame for Mutation Analysis ===
+outdf <- data.frame(
+    sample = character(),
+    rep = character(),
+    AA_anticodon = character(),
+    mod_pos1 = character(),
+    mod1 = character(),
+    mod_pos2 = character(),
+    mod2 = character(),
+    O_O = numeric(), 
+    O_l = numeric(), 
+    l_O = numeric(), 
+    l_l = numeric(), 
+    odds_ratio = numeric(),
+    pval = numeric(),
+    mut_percentage_pos1 = numeric(),
+    del_percentage_pos1 = numeric(),
+    mut_percentage_pos2 = numeric(),
+    del_percentage_pos2 = numeric(),
+    stringsAsFactors = FALSE
+)
+
+# === Create List of Unique tRNA Genes ===
+tRNA_gene_list <- unique(temp_ordered_count$AA_anticodon_N1)
+
+# === Loop Through Each tRNA Gene to Process Mutations ===
+for (tRNA_gene_unique in tRNA_gene_list) {
+    temp_ordered_count_per_gene <- temp_ordered_count[AA_anticodon_N1 == tRNA_gene_unique]
+
+    # === Filter Modtable to Match Gene Prefix ===
+    modtable_proc <- modtable %>% 
+        filter(substr(AA_anticodon_N1, 1, 9) == substr(tRNA_gene_unique, 1, 9))
+
+    # === Remove Unnecessary Columns from Modtable ===
+    col_to_remove <- names(modtable_proc)[sapply(modtable_proc, function(col) {
+        any(is.na(col)) || any(col == "-")
+    })]
+
+    modtable_proc_cleaned <- modtable_proc %>% 
+        select(-all_of(col_to_remove))
+
+    # === Transpose Modtable for Easier Mapping ===
+    transposed_modtable_proc_cleaned_df <- as.data.frame(t(modtable_proc_cleaned))
+
+    # === Filter Transposed Data to Remove Meta Columns ===
+    transposed_modtable_proc_cleaned_df <- transposed_modtable_proc_cleaned_df %>% 
+        filter(!rownames(transposed_modtable_proc_cleaned_df) %in% 
+               c("AA", "anticodon", "N1", "AA_anticodon_N1", "AA_anticodon")) %>%
+        mutate(
+            ref_mod = ifelse(V1 %in% c("U", "A", "G", "C"), "no", "yes"),
+            ref_pos = rownames(.)
+        )
+
+    # === Map Reference Positions and Mutations to Each Read ===
+    temp_ordered_count_per_gene <- temp_ordered_count_per_gene %>%
+        arrange(position) %>%
+        group_by(read_id) %>%
+        arrange(position) %>%
+        mutate(
+            starting_pos = min(position),
+            row_ind = row_number(),
+            ref_pos = map2_chr(row_ind, starting_pos - 1, ~ transposed_modtable_proc_cleaned_df$ref_pos[.x + .y]),
+            ref_mod = map2_chr(row_ind, starting_pos - 1, ~ transposed_modtable_proc_cleaned_df$V1[.x + .y])
+        ) %>%
+        ungroup()
+
+    # === Calculate Mutation and Deletion Counts ===
+    temp_ordered_count_per_gene <- temp_ordered_count_per_gene %>%
+        group_by(position) %>%
+        mutate(
+            real_base = ifelse(mutation == 1 | deletion == 1, first(ref_mod[mutation == 0 & deletion == 0], default = NA), base)
+        ) %>%
+        ungroup() %>%
+        group_by(read_id) %>%
+        arrange(row_ind) %>%
+        mutate(
+            mutdel = ifelse(mutation == 1 | deletion == 1, 1, 0),
+            mutwhat = case_when(
+                mutation == 1 ~ paste0(real_base, " to ", base),
+                deletion == 1 ~ paste0(real_base, " deleted"),
+                TRUE ~ NA_character_
+            )
+        ) %>%
+        ungroup()
+}
+
+# === Save Processed Data to RDS File ===
+saveRDS(outdf_all_genes, file = paste0(PATH_SinMol_tsv, "\\generated_dataframes\\", 
+                                        projname, "outdf_all_genes_cytoandmito_sample_", 
+                                        "_Date_", Sys.Date(), ".rds"))
+
+# === Print Completion Time ===
+end_time <- Sys.time()
+print(paste("End time:", end_time))
+
+# === Calculate and Print Script Duration ===
+duration <- end_time - start_time
+print(paste("Duration:", duration))
+
+```
+# === Crosstalk Heatmap Analysis ===
+```{r}
+# === Initialize Variables ===
+# ORlimit = 0.1  # (This is commented out but can be used for filtering)
+ref_mod1 <- c()  # Empty vector to store first modification reference
+ref_mod2 <- c()  # Empty vector to store second modification reference
+
+# Specify source type (either "cytosolic" or "mitochondrial")
+sourc <- c("cytosolic")  
+
+# Load dataset with crosstalk data
+filtered_data_spec <- crosstalk_MA56_S2
+
+# === Filter Data Based on Selected Modifications (If Specified) ===
+if (length(ref_mod1) > 0 && length(ref_mod2) > 0) {
+  filtered_data_spec <- filtered_data_spec %>%
+    filter(mod_pos1 %in% ref_mod1, mod_pos2 %in% ref_mod2)
+}
+
+# === Loop Through Sample Numbers to Generate Heatmaps ===
+for (n in samplenumlist) {
+  sample_num = get(paste0("var", n))  # Retrieve sample name dynamically
+  
+  # Filter the dataset for the current sample
+  filtered_data <- filtered_data_spec %>%
+    filter(substr(sample, 2, 2) == n) %>%
+    mutate(
+      crosstalk = paste0(mod_pos1, " - ", mod_pos2),  # Create a crosstalk identifier
+      source = ifelse(substr(AA_anticodon, 1, 2) == "mt", "mitochondrial", "cytosolic")
+    ) %>%
+    group_by(crosstalk) %>%
+    mutate(crosstalk_num = n()) %>%
+    ungroup() %>%
+    
+    # Filter based on significance, source type, and adjust for log2 odds ratios
+    filter(crosstalk_num >= 1, p_adjust <= 0.05, source %in% sourc) %>%
+    mutate(ORlog2 = log2(odds_ratio)) %>%
+    
+    # Compute the average odds ratio for visualization
+    group_by(sample, AA_anticodon, crosstalk) %>%
+    mutate(ORlog2_avg = mean(ORlog2)) %>%
+    ungroup() %>%
+    
+    # Compute modification position differences
+    mutate(mod_delta = as.numeric(mod_pos2) - as.numeric(mod_pos1)) %>%
+    
+    # Separate AA_anticodon into components
+    separate(AA_anticodon, into = c("AA", "anticodon", "N1"), sep = "-", remove = FALSE) %>%
+    mutate(
+      AA_anticodon_N1 = ifelse(N1 == "NA",
+                               str_c(AA, anticodon, sep = "-"),
+                               str_c(AA, anticodon, N1, sep = "-")
+      )
+    )
+
+  # Define groups for distance threshold between modifications
+  deltagroup <- c(1:2)  # 1 = close modifications (<=7), 2 = distant modifications (>7)
+  
+  for (delta_num in deltagroup) {
+
+    # === Function to Create Heatmap Plots ===
+    create_plots <- function(filtered_data, output_dir) {
+      
+      # Apply filtering based on modification distance
+      filtered_data <- filtered_data %>%  
+        {if (delta_num == 1) filter(., mod_delta <= 7) else filter(., mod_delta > 7)}
+      
+      unique_crosstalk <- unique(filtered_data$crosstalk)
+      crosstalk_chunks <- split(unique_crosstalk, ceiling(seq_along(unique_crosstalk) / 100))  # Split for manageable plots
+      
+      for (chunk_index in seq_along(crosstalk_chunks)) {
+        chunk <- crosstalk_chunks[[chunk_index]]
+        chunk_data <- filtered_data %>% filter(crosstalk %in% chunk)
+        
+        # Assign categories for different log2(odds ratio) cases
+        chunk_data <- chunk_data %>%
+          mutate(
+            ORlog2_status = case_when(
+              is.na(ORlog2_avg) ~ "NA",
+              ORlog2_avg == Inf ~ "Inf",
+              ORlog2_avg == -Inf ~ "-Inf",
+              TRUE ~ "Finite"
+            )
+          ) %>%
+          arrange(crosstalk, mod_pos1)
+
+        # === Generate Heatmap Plot ===
+        p <- ggplot(chunk_data, aes(x = AA_anticodon_N1, y = crosstalk)) +
+          geom_tile(data = chunk_data %>% filter(ORlog2_status == "Finite"),
+                    aes(fill = ORlog2_avg)) +
+          scale_color_gradient2(low = "blue",
+                                high = "red",
+                                space = "Lab",
+                                na.value = NA,
+                                guide = "colorbar",
+                                aesthetics = "fill",
+                                limits = c(-2, 2),
+                                oob = squish,
+                                name = paste0("log2(Odds Ratio)_AVG")) +
+          
+          # Additional tiles for special cases
+          geom_tile(data = chunk_data %>% filter(ORlog2_status == "Inf"), fill = "#8B0000") +
+          geom_tile(data = chunk_data %>% filter(ORlog2_status == "-Inf"), fill = "#120A8F") +
+          geom_tile(data = chunk_data %>% filter(ORlog2_status == "NA"), fill = "grey50") +
+          
+          # Add text annotations for modification positions and percentages
+          geom_text(data = chunk_data %>%
+                      group_by(sample, AA_anticodon, crosstalk) %>% 
+                      slice(1) %>%  
+                      ungroup(),
+                    aes(label = paste0(mod1, "-", mod2, "_", sprintf("%.1f", ORlog2_avg),
+                                       "\n", "_M1:", sprintf("%.0f", mut_percentage_pos1),
+                                       "_D1:", sprintf("%.0f", del_percentage_pos1),
+                                       "_M2:", sprintf("%.0f", mut_percentage_pos2),
+                                       "_D2:", sprintf("%.0f", del_percentage_pos2))),
+                    size = 7,
+                    color = "green") +
+          
+          # Labels and theme
+          labs(title = paste0("Crosstalk Plots for Sample:", sample_num, "_", ref_mod1, "-", ref_mod2, "-", chunk_index),
+               y = "Crosstalk") +
+          theme_minimal() +
+          theme(axis.text.y = element_text(hjust = 1, size = 20),
+                axis.text.x = element_text(size = 20, angle = 90),
+                axis.title.y = element_blank(),
+                axis.title.x = element_blank(),
+                panel.background = element_rect(fill = "white", colour = "white"),
+                panel.grid.major = element_blank(),
+                panel.grid.minor = element_blank(),
+                legend.position = "right",
+                plot.background = element_rect(fill = "white", colour = "white"),
+                plot.title = element_text(size = 30),
+                legend.title = element_text(size = 15, face = "bold"),
+                legend.text = element_text(size = 12),
+                legend.key.size = unit(0.8, "cm"))
+        
+        # === Save the Plot ===
+        file_name <- paste0("heatmap_per_gene_facet_wrap_cytoandmito_S", n, "_", sourc, "_", ref_mod1, "_", ref_mod2, "_", chunk_index, "_deltagroup", delta_num, "_", Sys.Date(), ".png")
+        file_path <- file.path(output_dir, file_name)
+        ggsave(file_path, plot = p, width = 15, height = 30, limitsize = FALSE)
+      }
+    }
+    
+    # Generate heatmap plots
+    create_plots(filtered_data, output_dir)
+  }
+}
+
+```
+# === Charging Crosstalk Plot ===
+```{r}
+outdf_all_genes
+# === Filter Data for Charging-Related Crosstalk ===
+filtered_data_spec <- crosstalk_MA56_S2 %>% 
+  filter(mod2 %in% c("charging"), substr(sample, 2, 2) == "2") %>%  # Select only "charging"-related modifications
+  arrange(mod_pos2)  # Sort by modification position
+
+# Process filtered data for visualization
+filtered_data <- filtered_data_spec %>%
+    mutate(
+      crosstalk = paste0(mod_pos1, " - ", mod_pos2),  # Create a unique crosstalk identifier
+      source = ifelse(substr(AA_anticodon, 1, 2) == "mt", "mitochondrial", "cytosolic")  # Assign source type
+    ) %>% 
+    group_by(crosstalk) %>% 
+    mutate(crosstalk_num = n()) %>%  # Count occurrences of each crosstalk
+    ungroup() %>% 
+    
+    # Filter for significant crosstalk pairs
+    filter(crosstalk_num >= 1, p_adjust <= 0.05, source %in% sourc) %>% 
+    mutate(ORlog2 = log2(odds_ratio)) %>%  # Compute log2 odds ratio
+    
+    # Compute average log2 odds ratio per sample
+    group_by(sample, AA_anticodon, crosstalk) %>% 
+    mutate(ORlog2_avg = mean(ORlog2)) %>% 
+    ungroup() %>% 
+    
+    # Compute modification position differences
+    mutate(mod_delta = as.numeric(mod_pos2) - as.numeric(mod_pos1)) %>% 
+    
+    # Separate AA_anticodon into components
+    separate(AA_anticodon, into = c("AA", "anticodon", "N1"), sep = "-", remove = FALSE) %>% 
+    mutate(
+      AA_anticodon_N1 = ifelse(N1 == "NA",
+                                  str_c(AA, anticodon, sep = "-"),
+                                  str_c(AA, anticodon, N1, sep = "-")
+    ))
+
+# === Function to Create Crosstalk Plots ===
+create_plots <- function(filtered_data, output_dir) {
+    unique_crosstalk <- unique(filtered_data$crosstalk)  # Get unique crosstalk pairs
+    crosstalk_chunks <- split(unique_crosstalk, ceiling(seq_along(unique_crosstalk) / 16))  # Split into chunks
+
+    for (chunk_index in seq_along(crosstalk_chunks)) {
+        chunk <- crosstalk_chunks[[chunk_index]]
+        chunk_data <- filtered_data %>% filter(crosstalk %in% chunk)
+
+        # Assign log2(odds ratio) status categories
+        chunk_data <- chunk_data %>%
+            mutate(
+              ORlog2_status = case_when(
+                is.na(ORlog2_avg) ~ "NA",
+                ORlog2_avg == Inf ~ "Inf",
+                ORlog2_avg == -Inf ~ "-Inf",
+                TRUE ~ "Finite"
+              )
+            ) %>% 
+            arrange(crosstalk, mod_pos1)
+
+        # === Generate Scatter Plot for Crosstalk ===
+        p <- ggplot(chunk_data, aes(x = AA_anticodon, y = ORlog2, color = ORlog2, fill = NA, shape = as.factor(sample))) +
+          geom_point(alpha = 0.5, stroke = 1.5, size = 1) +  # Plot points
+          geom_text_repel(aes(label = ifelse(odds_ratio != Inf, paste0(mod1, "-", mod2, "-", AA), NA)),
+                          size = 3, max.overlaps = 100) +  # Add labels
+          geom_hline(yintercept = 0, linetype = "dashed", color = "black") +  # Add horizontal reference line
+          scale_color_gradient(low = "blue", high = "red") +  # Set gradient scale
+          labs(
+            title = "Crosstalk Plots for tRNA Genes and Samples",
+            x = "",
+            y = "log2(Odds Ratio)",
+            color = "ORlog2",
+            shape = "Sample"
+          ) +
+          theme_minimal() +
+          theme(
+            plot.background = element_rect(fill = "white", color = "white"),
+            panel.background = element_rect(fill = "white", color = "white"),
+            panel.grid.major.y = element_line(color = "grey90"),
+            axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 5),
+            axis.text.y = element_text(size = 10),
+            axis.title.y = element_text(size = 20),
+            panel.border = element_rect(color = "lightgrey", fill = NA, size = 0.5)
+          ) + 
+          facet_wrap(~crosstalk, scales = "free")  # Separate facets by crosstalk pairs
+
+        # === Save the Plot ===
+        file_name <- paste0("crosstalk_charging_related_S2_", chunk_index, "_", Sys.Date(), ".png")
+        file_path <- file.path(output_dir, file_name)
+        ggsave(file_path, plot = p, width = 14, height = 10)
+    }
+}
+
+# === Generate Crosstalk Plots ===
+create_plots(filtered_data, output_dir)
+
+```
+# === Crosstalk Analysis: Generating Multiple Image Files ===
+```{r}
+# Define minimum odds ratio threshold for filtering
+ORlimit <- 0.1  
+
+# === Load necessary packages (install if missing) ===
+if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2")
+if (!requireNamespace("ggrepel", quietly = TRUE)) install.packages("ggrepel")
+
+# Load libraries
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+
+# === Create Output Directory if it Doesn't Exist ===
+dir.create(output_dir, showWarnings = FALSE)
+
+# === Loop Through Sample Numbers to Generate Plots ===
+for (n in samplenumlist) {
+  sample_num = get(paste0("var", n))  # Retrieve sample name dynamically
+
+  # Filter dataset for the current sample
+  filtered_data <- allsamples_outdf_all_genes %>%
+    filter(substr(sample, 2, 2) == n) %>%
+    filter(odds_ratio >= ORlimit & odds_ratio != Inf) %>%  # Apply OR filter
+    mutate(crosstalk = paste0(mod_pos1, " - ", mod_pos2)) %>%  # Create unique crosstalk ID
+    group_by(crosstalk) %>%
+    mutate(crosstalk_num = n()) %>%  # Count occurrences per crosstalk
+    ungroup() %>%
+    filter(crosstalk_num >= 2) %>%
+    mutate(ORlog2 = log2(odds_ratio)) %>%  # Compute log2 odds ratio
+    arrange(desc(ORlog2)) %>%
+    separate(AA_anticodon, into = c("AA", "anticodon", "N1"), sep = "-", remove = FALSE) %>%
+    mutate(
+      AA_anticodon_N1 = ifelse(N1 == "NA",
+                               str_c(AA, anticodon, sep = "-"),
+                               str_c(AA, anticodon, N1, sep = "-")
+      )
+    ) %>%
+    arrange(mod_pos2, mod_pos1)
+
+  # === Function to Create Crosstalk Plots and Save them ===
+  create_plots <- function(filtered_data, output_dir) {
+    unique_crosstalk <- unique(filtered_data$crosstalk)  # Get unique crosstalks
+    crosstalk_chunks <- split(unique_crosstalk, ceiling(seq_along(unique_crosstalk) / 16))  # Split for multiple images
+
+    for (chunk_index in seq_along(crosstalk_chunks)) {
+      chunk <- crosstalk_chunks[[chunk_index]]
+      chunk_data <- filtered_data %>% filter(crosstalk %in% chunk)
+
+      # === Generate Scatter Plot for Crosstalk ===
+      p <- ggplot(chunk_data, aes(x = AA_anticodon_N1, y = ORlog2, color = rep, shape = as.factor(sample))) +
+        geom_point(alpha = 0.5, stroke = 1.5, size = 0.1) +  # Plot points
+        geom_text_repel(aes(label = ifelse(odds_ratio != Inf, paste0(mod1, "-", mod2, "-", AA), NA)),
+                        size = 2, max.overlaps = 100) +  # Add labels
+        geom_hline(yintercept = 0, linetype = "dashed", color = "black") +  # Reference line at OR = 1
+        labs(title = paste0("Crosstalk Plots for tRNA Genes and Sample: ", sample_num),
+             x = "",
+             y = "log2(Odds Ratio)",
+             color = "rep",
+             shape = "Sample") +
+        theme_minimal() +
+        theme(
+          plot.background = element_rect(fill = "white"),
+          panel.background = element_rect(fill = "white"),
+          panel.grid.major.y = element_line(color = "grey90"),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 5),
+          panel.border = element_rect(color = "lightgrey", fill = NA, size = 0.5)
+        ) + 
+        facet_wrap(~crosstalk, scales = "free")  # Separate facets by crosstalk pairs
+
+      # === Save the Plot ===
+      file_name <- paste0("crosstalk_per_gene_S", n, "_", chunk_index, "_", Sys.Date(), ".png")
+      file_path <- file.path(output_dir, file_name)
+      ggsave(file_path, plot = p, width = 14, height = 10)
+    }
+  }
+
+  # Generate plots for the current sample
+  create_plots(filtered_data, output_dir)
+}
+
+```
+
+# === Generate a Crosstalk Plot for Odds Ratio > 0.1 ===
+```{r}
+# === Generate a Crosstalk Plot for Odds Ratio > 0.1 ===
+
+# Define minimum odds ratio threshold for filtering
+ORlimit <- 0.1  
+
+# === Filter dataset to retain only significant crosstalk interactions ===
+filtered_data_sig <- filtered_data %>% 
+  filter(ORlog2 >= ORlimit, substr(sample, 2, 2) == "2")  # Keep only significant interactions for sample "2"
+
+# === Function to Create Crosstalk Plots and Save them ===
+create_plots <- function(filtered_data, output_dir) {
+  unique_crosstalk <- unique(filtered_data$crosstalk)  # Extract unique crosstalks
+  crosstalk_chunks <- split(unique_crosstalk, ceiling(seq_along(unique_crosstalk) / 16))  # Divide into smaller chunks for multiple images
+
+  for (chunk_index in seq_along(crosstalk_chunks)) {
+    chunk <- crosstalk_chunks[[chunk_index]]
+    chunk_data <- filtered_data %>% filter(crosstalk %in% chunk)
+
+    # === Generate Scatter Plot for Crosstalk ===
+    p <- ggplot(chunk_data, aes(x = AA_anticodon, y = ORlog2, color = ORlog2, shape = as.factor(sample))) +
+      geom_point(alpha = 0.5, stroke = 1.5, size = 0.1) +  # Scatter points
+      geom_text_repel(aes(label = ifelse(odds_ratio != Inf, paste0(mod1, "-", mod2, "-", AA), NA)),
+                      size = 2, max.overlaps = 100) +  # Annotate points
+      geom_hline(yintercept = 0, linetype = "dashed", color = "black") +  # Reference line for OR = 1
+      scale_color_gradient(low = "blue", high = "red") +  # Color scale for ORlog2
+      labs(
+        title = "Crosstalk Plots for tRNA Genes and Samples",
+        x = "",
+        y = "log2(Odds Ratio)",
+        color = "ORlog2",
+        shape = "Sample"
+      ) +
+      theme_minimal() +
+      theme(
+        plot.background = element_rect(fill = "white"),
+        panel.background = element_rect(fill = "white"),
+        panel.grid.major.y = element_line(color = "grey90"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 5),
+        panel.border = element_rect(color = "lightgrey", fill = NA, size = 0.5)
+      ) + 
+      facet_wrap(~crosstalk, scales = "free")  # Separate facets by crosstalk interactions
+
+    # === Save the Plot ===
+    file_name <- paste0("S2_per_crosstalk_sig_facet_wrap_cytoandmito_", chunk_index, "_", Sys.Date(), ".png")
+    file_path <- file.path(output_dir, file_name)
+    ggsave(file_path, plot = p, width = 14, height = 10)
+  }
+}
+
+# Generate plots for the filtered dataset
+create_plots(filtered_data_sig, output_dir)
+
+```
+# === Crosstalk Analysis for Positions 55 and 58 ===
+```{r}
+# Define minimum odds ratio threshold for filtering
+ORlimit <- 0.1
+
+# Define target modification positions
+ref_mod1 <- c(55)
+ref_mod2 <- c(58)
+
+# === Filter dataset to retain only interactions between positions 55 and 58 ===
+filtered_data_spec <- crosstalk_MA56_S2 %>% 
+  filter(mod_pos1 %in% ref_mod1, mod_pos2 %in% ref_mod2)  
+
+# === Loop Through Sample Numbers to Generate Plots ===
+for (n in samplenumlist) {
+  sample_num = get(paste0("var", n))  # Retrieve sample name dynamically
+
+  # Filter dataset for the current sample
+  filtered_data <- filtered_data_spec %>%
+    filter(substr(sample, 2, 2) == n) %>%
+    filter(odds_ratio != Inf) %>%
+    mutate(crosstalk = paste0(mod_pos1, " - ", mod_pos2)) %>%
+    group_by(crosstalk) %>%
+    mutate(crosstalk_num = n()) %>%
+    ungroup() %>%
+    filter(crosstalk_num >= 1, p_adjust <= 0.05) %>%
+    mutate(ORlog2 = log2(odds_ratio)) %>%
+    group_by(sample, gene, crosstalk) %>%
+    mutate(ORlog2_avg = mean(ORlog2)) %>%
+    ungroup() %>%
+    separate(AA_anticodon, into = c("AA", "anticodon", "N1"), sep = "-", remove = FALSE) %>%
+    mutate(
+      AA_anticodon_N1 = ifelse(N1 == "NA",
+                               str_c(AA, anticodon, sep = "-"),
+                               str_c(AA, anticodon, N1, sep = "-")
+      )
+    ) %>%
+    mutate(AA_anticodon_N1 = reorder(AA_anticodon_N1, ORlog2_avg))
+
+  # === Function to Create Crosstalk Plots and Save them ===
+  create_plots <- function(filtered_data, output_dir) {
+    unique_crosstalk <- unique(filtered_data$crosstalk)  # Extract unique crosstalks
+    crosstalk_chunks <- split(unique_crosstalk, ceiling(seq_along(unique_crosstalk) / 16))  # Divide into smaller chunks for multiple images
+
+    for (chunk_index in seq_along(crosstalk_chunks)) {
+      chunk <- crosstalk_chunks[[chunk_index]]
+      chunk_data <- filtered_data %>% filter(crosstalk %in% chunk)
+
+      # === Generate Scatter Plot for Crosstalk ===
+      p <- ggplot(chunk_data, aes(x = AA_anticodon_N1, y = ORlog2_avg, color = as.factor(sample))) +
+        geom_point(alpha = 0.5, stroke = 1.5, size = 0.1) +  # Scatter points
+        geom_text_repel(
+          data = chunk_data %>%
+            group_by(sample, AA_anticodon, crosstalk) %>%  # Group by relevant variables
+            slice(1) %>%  # Retain only the first replicate within each group
+            ungroup(),
+          aes(label = paste0(mod1, mod_pos1, "-", mod2, mod_pos2, "-", AA)),
+          size = 2,
+          max.overlaps = 100
+        ) +
+        geom_hline(yintercept = 0, linetype = "dashed", color = "black") +  # Reference line at OR = 1
+        labs(
+          title = paste0("Crosstalk Plots for tRNA Genes and Sample:", sample_num, "_", ref_mod1, "-", ref_mod2),
+          x = "",
+          y = "log2(Odds Ratio)",
+          color = "sample"
+        ) +
+        theme_minimal() +
+        theme(
+          plot.background = element_rect(fill = "white"),
+          panel.background = element_rect(fill = "white"),
+          panel.grid.major.y = element_line(color = "grey90"),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 5),
+          panel.border = element_rect(color = "lightgrey", fill = NA, size = 0.5)
+        )
+
+      # === Save the Plot ===
+      file_name <- paste0("per_gene_facet_wrap_cytoandmito_free_AVG_S", n, "_", ref_mod1, "_", ref_mod2, "_", chunk_index, "_", Sys.Date(), ".png")
+      file_path <- file.path(output_dir, file_name)
+      ggsave(file_path, plot = p, width = 14, height = 10)
+    }
+  }
+
+  # Generate plots for the current sample
+  create_plots(filtered_data, output_dir)
+}
+
+```
+
+
+# === Crosstalk Analysis for Position 58 ===
+```{r}
+# === Filter dataset to retain only interactions involving position 58 in sample 2 ===
+filtered_data_spec <- crosstalk_MA56_S2 %>% 
+  filter(mod_pos2 == 58, substr(sample, 2, 2) == "2") %>% 
+  arrange(mod_pos2)  # Sort by modification position 2
+
+# === Function to Create Crosstalk Plots and Save them ===
+create_plots <- function(filtered_data, output_dir) {
+  
+  unique_crosstalk <- unique(filtered_data$crosstalk)  # Extract unique crosstalk interactions
+  crosstalk_chunks <- split(unique_crosstalk, ceiling(seq_along(unique_crosstalk) / 16))  # Divide into smaller chunks for multiple images
+
+  for (chunk_index in seq_along(crosstalk_chunks)) {
+    chunk <- crosstalk_chunks[[chunk_index]]
+    chunk_data <- filtered_data %>% filter(crosstalk %in% chunk)
+
+    # === Generate Scatter Plot for Crosstalk ===
+    p <- ggplot(chunk_data, aes(x = tRNA_gene, y = ORlog2, color = ORlog2, shape = as.factor(sample))) +
+      geom_point(alpha = 0.5, stroke = 1.5, size = 1) +  # Scatter points
+      geom_text_repel(aes(label = ifelse(odds_ratio != Inf, paste0(mod1, "-", mod2, "-", AA), NA)),
+                      size = 3, max.overlaps = 100) +  # Annotate points
+      geom_hline(yintercept = 0, linetype = "dashed", color = "black") +  # Reference line for OR = 1
+      scale_color_gradient(low = "blue", high = "red") +  # Color scale for ORlog2
+      labs(
+        title = "Crosstalk Plots for tRNA Genes and Samples",
+        x = "",
+        y = "log2(Odds Ratio)",
+        color = "ORlog2",
+        shape = "Sample"
+      ) +
+      theme_minimal() +
+      theme(
+        plot.background = element_rect(fill = "white"),
+        panel.background = element_rect(fill = "white"),
+        panel.grid.major.y = element_line(color = "grey90"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 5),
+        axis.text.y = element_text(size = 10),
+        axis.title.y = element_text(size = 20),
+        panel.border = element_rect(color = "lightgrey", fill = NA, size = 0.5)
+      ) + 
+      facet_wrap(~crosstalk, scales = "free")  # Separate facets by crosstalk pairs
+
+    # === Save the Plot ===
+    file_name <- paste0("per_crosstalk_spec58related_S2_facet_wrap_cyto_free_", chunk_index, "_", Sys.Date(), ".png")
+    file_path <- file.path(output_dir, file_name)
+    ggsave(file_path, plot = p, width = 14, height = 10)
+  }
+}
+
+# Generate plots for the filtered dataset
+create_plots(filtered_data_spec, output_dir)
+
+```
+
+# === Restore Crosstalk Data and Save as Excel ===
+```{r}
+
+# Check if the 'writexl' package is installed; install it if necessary
+if (!requireNamespace("writexl", quietly = TRUE)) {
+  install.packages("writexl")
+}
+library(writexl)  # Load package for writing Excel files
+
+# Define the output Excel file path
+excel_file <- paste0(PATH_SinMol_tsv, "\\generated_dataframes\\", projname, "_crosstalk_MA56_mitochondrial_", Sys.Date(), ".xlsx")
+
+# Save the crosstalk dataset as an Excel file
+write_xlsx(crosstalk_MA56, excel_file)
+
+print(paste("Saved crosstalk data as:", excel_file))
+
+
+```
+
+# === Save and Restore Dataframes for Crosstalk Analysis ===
+```{r}
+
+# Save a CSV backup (if needed for manual inspection)
+# write.csv(temp_mito, file = paste0(projname, "_exce_test_", Sys.Date(), ".csv"), row.names = FALSE, na = "")
+
+# Save processed tRNA data as RDS
+# saveRDS(hg38_tRNA_SM_processed, file = paste0(PATH_SinMol_tsv, projname, "_exce_test_", Sys.Date(), ".rds"))
+
+# === Load previously saved RDS file for processed tRNA data ===
+hg38_tRNA_SM_processed <- readRDS(paste0(PATH_SinMol_tsv, "\\generated_dataframes\\MA-13-5-SinMol_tsvfilesMA-13-56_PUSKO_BID_exce_test_2024-10-30.rds"))
+
+# Print the paths to verify correct loading
+print(PATH_SinMol_tsv)
+print(projname)
+
+# Save all samples data as an RDS file
+saveRDS(allsamples_outdf_all_genes, 
+        file = paste0(PATH_SinMol_tsv, "\\generated_dataframes\\", projname, 
+                      "allsamples_outdf_all_genes_S1-_cytoandmito_", Sys.Date(), ".rds"))
+
+# Reload temp_ordered_count (used for further processing)
+temp_ordered_count <- readRDS(paste0(PATH_SinMol_tsv, "\\generated_dataframes\\", projname, 
+                                     "_temp_ordered_count_cytoandmito_", Sys.Date(), ".rds"))
+
+# === Load previously saved RDS file for all samples ===
+allsamples_outdf_all_genes <- readRDS(paste0(PATH_SinMol_tsv, "\\generated_dataframes\\", "Chenyou_polysome2024_2025outdf_all_genes_genes_cytoandmito_sample_2_Date_2025-02-11.rds"))
+
+allsamples_outdf_all_genes2 <- readRDS(paste0(PATH_SinMol_tsv, "\\generated_dataframes\\", "Chenyou_polysome2024_2025allsamples_outdf_all_genes_cytoandmito_sample_2_Date_2025-02-06.rds"))
+
+write_xlsx(allsamples_outdf_all_genes, "polysome_MA-13-6_Coordination table.xlsx")
+
+outdf_all_genes <- readRDS("C:\\Users\\panla\\Box\\1 UChicago ;))))))\\1. Ph.D. Project\\Data analysis\\tsv_files\\MA-13-6-SinMol_tsvfiles\\generated_dataframes\\MA-13-56_PUSKO_BIDallsamples_outdf_all_genes_cytoandmito_sample_2_Date_2024-12-19.rds")
+
+# === Restore and Save Crosstalk Data ===
+crosstalk_MA56 <- outdf_all_genes
+saveRDS(crosstalk_MA56, 
+        file = paste0(PATH_SinMol_tsv, "\\generated_dataframes\\", projname, 
+                      "_crosstalk_MA56_mitochondrial_", Sys.Date(), ".rds"))
+
+# === Reload previously saved crosstalk dataset for mitochondrial samples ===
+crosstalk_MA56 <- readRDS(paste0(PATH_SinMol_tsv, "\\generated_dataframes\\", projname,
+                                 "_crosstalk_MA56_mitochondrial_", "2024-11-27", ".rds"))
+
+# === Load additional sample-specific crosstalk datasets ===
+crosstalk_MA56_S1 <- readRDS(paste0(PATH_SinMol_tsv, "\\generated_dataframes\\", 
+                                   "MA-13-56_PUSKO_BIDallsamples_outdf_all_genes_cytoandmito_sample_1_Date_2024-12-19", ".rds"))
+
+crosstalk_MA56_S2 <- readRDS(paste0(PATH_SinMol_tsv, "\\generated_dataframes\\", 
+                                   "MA-13-56_PUSKO_BIDallsamples_outdf_all_genes_cytoandmito_sample_2_Date_2024-12-19", ".rds"))
+
+# === Reload temporary ordered count dataset for sample 2 ===
+temp_ordered_count <- readRDS(paste0(PATH_SinMol_tsv, "\\generated_dataframes\\", 
+                                     "Chenyou_polysome2024_2025temp_ordered_count_cytoandmito_sample_2_Date_2025-02-06", ".rds"))
+temp_ordered_count <- readRDS("C:\\Users\\panla\\Box\\1 UChicago ;))))))\\1. Ph.D. Project\\Data analysis\\tsv_files\\MA-13-5_PUSKO_BID\\generated_dataframes\\MA-13-56_PUSKO_BID_allsamples_temp_ordered_count_2025-01-13.rds")
+# Cleanup: Remove unnecessary variables and free memory
+rm(temp_ordered_count, outdf_all_genes)
+gc()  # Garbage collection to free up memory
+
+# Restore `outdf_all_genes` from `crosstalk_MA56`
+outdf_all_genes <- crosstalk_MA56
+
+```
