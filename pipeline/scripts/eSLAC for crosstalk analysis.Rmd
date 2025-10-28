@@ -1,0 +1,465 @@
+###############################################################################
+# Polysome tRNA MSR-seq Processing & Crosstalk Scaffolding
+# Author: Mahdi Assari
+# Project: Chenyou_polysome2024_2025
+# Notes:
+#   - This script is written to be Conda/renv friendly: it DOES NOT install
+#     packages from within R. If packages are missing, it stops with a clear
+#     Conda command you can paste.
+#   - Heavy steps are parallelized. Adjust NUM_CORES below as needed.
+#   - All file paths are POSIX-style (Linux). Adjust if needed for your env.
+###############################################################################
+
+## ── 0) Required packages (no install here; use Conda) ────────────────────────
+
+required_packages <- c(
+  "tidyverse", "ggplot2", "purrr", "readxl", "foreach",
+  "doParallel", "gridExtra", "ggpubr", "data.table", "stringr", "ggrepel"
+)
+
+missing_packages <- setdiff(required_packages, installed.packages()[, "Package"])
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing required packages.\nInstall via Conda (example):\n\n",
+    "conda install -n rstudio_env ",
+    paste0("r-", gsub("^r-", "", tolower(missing_packages)), collapse = " ")
+  )
+}
+
+invisible(lapply(required_packages, library, character.only = TRUE))
+message("✅ All required packages are installed and loaded.")
+
+## ── 1) Configuration ─────────────────────────────────────────────────────────
+
+# Which sample numbers to process (as coded in your `var*` labels)
+samplenumlist <- 4L  # e.g., only sample "(4)poly_+BS"
+
+# Filtering thresholds
+mutdellim <- 5  # % threshold used later for mutation/deletion site filtering
+
+# Isoacceptors to exclude
+exclude_isoaccep <- list("Ile-GAT-1", "Tyr-ATA-1")
+
+# Label mapping for samples
+var1 <- "(1)Inp_noBS"
+var2 <- "(2)poly_noBS"
+var3 <- "(3)Inp_+BS"
+var4 <- "(4)poly_+BS"
+
+# Source filter for downstream plots
+sourc <- c("cytosolic")
+
+# Parallel settings
+NUM_CORES <- max(1L, parallel::detectCores() - 2L)
+
+## ── 2) Paths ─────────────────────────────────────────────────────────────────
+
+# Base directory
+path1 <- "/project/taopan/mahdi/jupyter_R"
+
+# Subdirectories
+path2 <- "/Chenyou_polysome2024_2025"
+path3 <- "/5_tsv"
+path4 <- "/Chenyou_polysome2024_2025/sinmol"
+path5 <- "/hg38_tRNA_HC_intro_removed_CCA_upper_case"
+path6 <- "/Chenyou_polysome2024_2025/sinmol"
+
+# Reference tables
+path8 <- "/project/taopan/mahdi/jupyter_R/all_tRNA_seq_numbering_MA_20250122.xlsx"
+
+# Project name
+projname <- "Chenyou_polysome2024_2025"
+
+# Input TSV folder (SinMol tsv)
+PATH_SinMol_tsv <- paste0(path1, path6)
+
+# Outputs
+output_dir          <- file.path(PATH_SinMol_tsv, "plots")
+generated_dataframes <- file.path(PATH_SinMol_tsv, "generated_dataframes")
+dir.create(output_dir,          showWarnings = FALSE, recursive = TRUE)
+dir.create(generated_dataframes, showWarnings = FALSE, recursive = TRUE)
+
+## ── 3) Global theme & helpers ────────────────────────────────────────────────
+
+theme_set(
+  theme_bw() +
+    theme(
+      legend.position = "bottom",
+      text = element_text(family = "Arial", size = 14),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.background  = element_rect(color = "black")
+    )
+)
+
+`%nin%` <- Negate(`%in%`)  # handy negation
+
+gc()
+
+## ── 4) Load modification table & clean ───────────────────────────────────────
+
+modtable <- readxl::read_excel(path8)
+
+modtable <- modtable %>%
+  dplyr::select(1:103) %>%
+  dplyr::mutate(dplyr::across(2:103, ~na_if(., "-"))) %>%
+  dplyr::mutate(dplyr::across(2:103, ~na_if(., "."))) %>%
+  dplyr::mutate(dplyr::across(2:103, ~gsub("[tU]", "T", .))) %>%
+  dplyr::mutate(dplyr::across(2:103, ~gsub("g", "G", .))) %>%
+  dplyr::mutate(dplyr::across(2:103, ~gsub("c", "C", .))) %>%
+  dplyr::mutate(AA_anticodon_N1 = AA) %>%
+  tidyr::separate(AA, c("AA", "anticodon", "N1"), sep = "-", remove = TRUE) %>%
+  dplyr::mutate(AA_anticodon = paste(AA, anticodon, sep = "-"))
+
+## ── 5) Enumerate & parse TSV files ──────────────────────────────────────────
+
+FILES <- data.frame(file_name = list.files(PATH_SinMol_tsv))
+
+FILES <- FILES %>%
+  dplyr::filter(grepl("\\.tsv$", file_name),
+                !grepl("unassigned", file_name)) %>%
+  tidyr::extract(file_name, "(.*)\\.tsv", into = "file_name2", remove = FALSE) %>%
+  tidyr::separate(
+    file_name2,
+    into = c("junk0","junk2","sample","junk3","junk4","bc","junk5","binstart","binstop"),
+    sep = "_",
+    remove = TRUE
+  ) %>%
+  dplyr::select(file_name, sample, bc, binstart, binstop) %>%
+  # map sample labels
+  dplyr::mutate(
+    sample = dplyr::case_when(
+      sample == "S5" & bc %in% c("bc5", "bc10") ~ var1,
+      sample == "S5" & bc %in% c("bc8", "bc9")  ~ var2,
+      sample == "S4" & bc %in% c("bc5", "bc10") ~ var3,
+      sample == "S4" & bc %in% c("bc8", "bc9")  ~ var4,
+      TRUE ~ sample
+    )
+  ) %>%
+  # keep only rows where the sample actually changed (renamed)
+  dplyr::filter(sample != FILES$sample) %>%
+  dplyr::mutate(
+    binstart = ifelse(is.na(binstart), -3, binstart),
+    binstop  = ifelse(is.na(binstop),  -3, binstop)
+  )
+
+## ── 6) Read TSVs (parallel), filter, normalize names ────────────────────────
+
+start_time <- Sys.time(); message("⏱️ Start: ", start_time)
+
+FILES_oneS <- FILES %>%
+  dplyr::filter(substr(sample, 2, 2) %in% samplenumlist) %>%
+  data.table::as.data.table()
+
+selected_columns <- c("read_id", "gene", "position", "base", "deletion", "mutation", "insertion")
+
+cl <- parallel::makeCluster(NUM_CORES)
+doParallel::registerDoParallel(cl)
+
+hg38_tRNA_SM <- foreach::foreach(i = seq_len(nrow(FILES_oneS)),
+                                 .combine = 'rbind', .packages = 'data.table') %dopar% {
+  row <- FILES_oneS[i, ]
+  fp  <- file.path(PATH_SinMol_tsv, row$file_name)
+  if (!file.exists(fp)) return(NULL)
+  temp <- data.table::fread(fp, sep = '\t', select = selected_columns, showProgress = FALSE)
+  temp[, `:=`(sample = row$sample, bc = row$bc)]
+  temp
+}
+
+parallel::stopCluster(cl)
+hg38_tRNA_SM <- data.table::rbindlist(hg38_tRNA_SM, use.names = TRUE, fill = TRUE)
+gc()
+
+# Remove rRNA/spike-ins/external and insertions
+hg38_tRNA_SM <- hg38_tRNA_SM[
+  !(gene %in% c(
+    "NR_004394.1", "NR_002716.3", "NR_003925.1",
+    "NR_004430.2", "NR_002756.2", "NR_004391.1",
+    "NR_004392.1", "NR_004393.1", "NR_001571.2",
+    "Homo_sapiens_chrX.rRNA-5SR5SR", "Homo_sapiens_chrX.rRNA-58S58S",
+    "Ecoli_Tyr", "Yeast_Phe", "Ecoli_Lys",
+    "spikein_SCC1", "spikein_SCCA1", "spikein_SCCA2", "spikein_SCCA3"
+  )) & insertion == 0
+]
+
+# Normalize gene names: drop prefix and ensure "-" before last 3 chars if missing
+hg38_tRNA_SM[, gene := stringr::str_remove(gene, "^Homo_sapiens_tRNA-")]
+hg38_tRNA_SM[, gene := ifelse(!stringr::str_detect(gene, "-"),
+                              stringr::str_replace(gene, "(...$)", "-\\1"),
+                              gene)]
+
+# Optional filter: AA_anticodonofInt (leave empty to keep all)
+AA_anticodonofInt <- character(0)
+if (length(AA_anticodonofInt) > 0) {
+  hg38_tRNA_SM <- hg38_tRNA_SM[substr(gene, 1, 7) %in% AA_anticodonofInt]
+}
+
+# Source tag
+hg38_tRNA_SM[, source := ifelse(substr(gene, 1, 2) == "mt", "mitochondrial", "cytosolic")]
+
+# Rename bc -> rep
+data.table::setnames(hg38_tRNA_SM, "bc", "rep")
+
+# Keep relevant columns
+hg38_tRNA_SM <- hg38_tRNA_SM[, .(read_id, sample, rep, source, gene, position, base, mutation, deletion)]
+
+# Order per read (descending position so first==5' side for charging logic)
+hg38_tRNA_SM <- hg38_tRNA_SM[order(-position), .SD, by = read_id]
+
+# Read-level attributes
+hg38_tRNA_SM[, read_size_nt := .N, by = read_id]
+hg38_tRNA_SM[, top3_bases   := paste0(base[1], base[2], base[3]), by = read_id]
+
+# Charging calls
+hg38_tRNA_SM[, charging := data.table::fcase(
+  grepl("^CC[ATCG]$", top3_bases), -1,  # uncharged
+  top3_bases == "ACC",               1,  # charged
+  default = NA_integer_
+)]
+hg38_tRNA_SM[, top3_bases := NULL]
+gc()
+
+## ── 7) Counts & gene splits ─────────────────────────────────────────────────
+
+# First occurrence of position per read (anchor)
+temp_count <- hg38_tRNA_SM[order(position),
+  .(position = first(position)),
+  by = .(sample, rep, gene, read_id, source)
+]
+
+# Aggregates (per rep / per sample / per source)
+temp_count[, tRNA_gene_count_per_rep       := .N, by = .(sample, rep, gene)]
+temp_count[, tRNA_gene_count_all_rep       := .N, by = .(sample, gene)]
+temp_count[, tRNA_gene_count_per_rep_total := .N, by = .(sample, rep, source)]
+temp_count[, tRNA_gene_percent_per_rep     := tRNA_gene_count_per_rep / tRNA_gene_count_per_rep_total * 100]
+temp_count[, tRNA_gene_count_all_rep_total := .N, by = .(sample, source)]
+temp_count[, tRNA_gene_percent_all_rep     := tRNA_gene_count_all_rep / tRNA_gene_count_all_rep_total * 100]
+temp_count[, allcount_per_source           := .N, by = source]
+temp_count[, tRNA_gene_count               := .N, by = gene]
+temp_count[, tRNA_gene_count_isodecod_per  := tRNA_gene_count / allcount_per_source]
+
+# Merge back
+temp_ordered_count <- data.table::copy(temp_count)[hg38_tRNA_SM,
+  on = .(sample, rep, gene, source, read_id, position)]
+
+# Split gene into AA / anticodon / N1 / N2
+temp_ordered_count[, c("AA", "anticodon", "N1", "N2") := tstrsplit(gene, "-", fixed = TRUE)]
+temp_ordered_count <- temp_ordered_count[order(gene, sample, rep, position)]
+temp_ordered_count[, AA_anticodon    := paste0(AA, "-", anticodon)]
+temp_ordered_count[, AA_anticodon_N1 := paste0(AA_anticodon, "-", N1)]
+
+# Optional gene filter again at AA_anticodon level
+if (length(AA_anticodonofInt) > 0) {
+  temp_ordered_count <- temp_ordered_count[AA_anticodon %in% AA_anticodonofInt]
+}
+
+# Final order for charging logic
+data.table::setorder(temp_ordered_count, -position)
+
+# Save checkpoint
+saveRDS(
+  temp_ordered_count,
+  file = file.path(
+    generated_dataframes,
+    paste0(projname, "_temp_ordered_count_cytoandmito_", Sys.Date(), ".rds")
+  )
+)
+
+## ── 8) Charging summary & visualization ─────────────────────────────────────
+
+# One row per read_id with charging call; require decent read length
+read_id_temp_ordered_count <- temp_ordered_count[order(position),
+  .(position = first(position)),
+  by = .(read_id, AA_anticodon, charging, read_size_nt, sample, rep)
+][read_size_nt >= 60]
+
+# Sanity counts
+charged_n   <- read_id_temp_ordered_count[charging == 1, .N]
+uncharged_n <- read_id_temp_ordered_count[charging == -1, .N]
+NAcharged_n <- read_id_temp_ordered_count[is.na(charging), .N]
+message("Charged: ", charged_n, " | Uncharged: ", uncharged_n, " | NA: ", NAcharged_n)
+
+# Charging ratio = charged / (charged + uncharged)
+temp_ratio <- read_id_temp_ordered_count[charging %in% c(1, -1),
+  .(
+    charged_read_id   = sum(charging == 1),
+    uncharged_read_id = sum(charging == -1),
+    charging_ratio    = {
+      tot <- sum(charging == 1) + sum(charging == -1)
+      ifelse(tot > 0, sum(charging == 1) / tot, NA_real_)
+    }
+  ),
+  by = .(AA_anticodon, sample, rep)
+] %>%
+  dplyr::arrange(dplyr::desc(as.numeric(stringr::str_sub(sample, 2, 2))), AA_anticodon)
+
+# Plot for a single group (match samplenumlist = 4)
+group1 <- "4"  # matches "(4)poly_+BS"
+interest <- "charging_ratio"
+maxy <- 1.0
+
+custom_colors <- c(group1 = "red"); names(custom_colors) <- group1
+custom_labels <- c(group1 = get(paste0("var", as.numeric(group1)))); names(custom_labels) <- group1
+
+p <- ggplot(
+  temp_ratio,
+  aes(x = AA_anticodon, y = .data[[interest]], fill = stringr::str_sub(sample, 2, 2))
+) +
+  geom_col(position = position_dodge(), width = 0.7) +
+  geom_text(
+    aes(label = paste0(sprintf("%.0f", charged_read_id), " charged")),
+    size = 3,
+    position = position_dodge(width = 0.9),
+    vjust = -0.2
+  ) +
+  scale_y_continuous(limits = c(0, maxy)) +
+  labs(
+    x = "AA-anticodon",
+    y = "Charging ratio",
+    title = paste0("Charging ratio — Sample ", group1),
+    fill  = "Sample Group"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.background  = element_rect(fill = "white", color = "white"),
+    panel.background = element_rect(fill = "white", color = "white"),
+    panel.grid.major = element_line(color = "white"),
+    panel.grid.minor = element_line(color = "white"),
+    panel.grid.major.y = element_line(color = "grey90"),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 10),
+    axis.text.y = element_text(size = 12),
+    panel.border = element_rect(color = "lightgrey", fill = NA, linewidth = 0.5)
+  ) +
+  scale_fill_manual(values = custom_colors, labels = custom_labels)
+
+ggsave(
+  filename = file.path(
+    output_dir,
+    paste0(
+      "tRNA_", interest, "_", group1, "_samplegroups_",
+      paste(sourc, collapse = "-"), "_AVG_FL_maxy", maxy, "_",
+      projname, "_", Sys.Date(), ".png"
+    )
+  ),
+  plot = p, width = 14, height = 10
+)
+
+## ── 9) Abundance plots per AA (quick glance) ─────────────────────────────────
+
+# Make sure output_dir exists (already created above)
+filtered_data_AA <- temp_ordered_count[order(position),
+  .SD[1], by = read_id, .SDcols = setdiff(names(temp_ordered_count), "read_id")
+][, .SD[1], by = .(sample, rep, AA_anticodon_N1)]
+
+create_plots_abundant <- function(filtered_data, outdir) {
+  unique_AA <- unique(filtered_data$AA)
+  chunks    <- split(unique_AA, ceiling(seq_along(unique_AA) / 16))
+
+  for (i in seq_along(chunks)) {
+    chunk <- chunks[[i]]
+    chunk_data <- filtered_data[AA %in% chunk]
+
+    p <- ggplot(
+      chunk_data,
+      aes(x = AA_anticodon, y = tRNA_gene_percent_per_rep, color = rep, shape = as.factor(sample))
+    ) +
+      geom_point(alpha = 0.6, size = 1.3) +
+      ggrepel::geom_text_repel(aes(label = paste0(rep, "-", AA_anticodon)), size = 2, max.overlaps = 200) +
+      labs(title = "Most Abundant tRNA Genes", x = "", y = "tRNA % (per rep)", color = "Rep", shape = "Sample") +
+      theme_minimal() +
+      theme(
+        plot.background  = element_rect(fill = "white", color = "white"),
+        panel.background = element_rect(fill = "white", color = "white"),
+        panel.grid.major = element_line(color = "grey90"),
+        axis.text.x      = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 7),
+        axis.text.y      = element_text(size = 10),
+        axis.title.y     = element_text(size = 14),
+        strip.text       = element_text(size = 14)
+      ) +
+      facet_wrap(~AA, scales = "free")
+
+    ggsave(
+      filename = file.path(outdir, paste0("AA_abundance_sample_S", samplenumlist[1], "_", i, "_", Sys.Date(), ".png")),
+      plot = p, width = 14, height = 10
+    )
+  }
+}
+
+create_plots_abundant(filtered_data_AA, output_dir)
+
+## ── 10) Crosstalk computation (scaffold) ─────────────────────────────────────
+# NOTE:
+# Your original crosstalk block is very long and tightly coupled to your
+# environment (e.g., external RDS lists, long nested loops). Below is a clean
+# scaffold that you can drop your inner per‑gene logic into. It keeps parallel,
+# FDR, and saving conventions consistent.
+
+compute_crosstalk_per_gene <- function(temp_ordered_count_gene, modtable_gene, mutdellim = 5) {
+  # TODO: paste your cleaned per‑gene logic here (mapping ref_pos/ref_mod,
+  #       building 2x2 tables, Fisher’s exact test, etc.) and return a
+  #       data.frame with the following columns:
+  # sample, rep, AA_anticodon_N1, mod_pos1, mod1, mod_pos2, mod2,
+  # O_O, O_l, l_O, l_l, odds_ratio, pval,
+  # (optionally) mut_percentage_pos1, del_percentage_pos1, mut_percentage_pos2, del_percentage_pos2
+  outdf <- data.frame(
+    sample = character(), rep = character(), AA_anticodon_N1 = character(),
+    mod_pos1 = numeric(), mod1 = character(), mod_pos2 = numeric(), mod2 = character(),
+    O_O = numeric(), O_l = numeric(), l_O = numeric(), l_l = numeric(),
+    odds_ratio = numeric(), pval = numeric(),
+    mut_percentage_pos1 = numeric(), del_percentage_pos1 = numeric(),
+    mut_percentage_pos2 = numeric(), del_percentage_pos2 = numeric(),
+    stringsAsFactors = FALSE
+  )
+  return(outdf)
+}
+
+# Example driver (disabled by default):
+RUN_CROSSTALK <- FALSE
+if (RUN_CROSSTALK) {
+  # OPTIONAL: load your “most abundant” list; skip if file not present
+  most_abun_rds <- file.path(path1, "MA-13-5-SinMol_tsvfiles", "generated_dataframes",
+                             "MA-13-56_PUSKO_BIDmost_abun_isodecod_list-_cytoandmito_2024-12-17.rds")
+  if (file.exists(most_abun_rds)) {
+    most_abun_isodecod_list <- readRDS(most_abun_rds) |> unlist()
+    most_abun_isodecod_list <- setdiff(most_abun_isodecod_list, unlist(exclude_isoaccep))
+    temp_ordered_count_abun <- temp_ordered_count[AA_anticodon_N1 %in% most_abun_isodecod_list]
+  } else {
+    warning("Most-abundant list not found; using all genes.")
+    temp_ordered_count_abun <- data.table::copy(temp_ordered_count)
+  }
+
+  tRNA_gene_list <- unique(temp_ordered_count_abun$AA_anticodon_N1)
+
+  cl <- parallel::makeCluster(NUM_CORES)
+  doParallel::registerDoParallel(cl)
+
+  allsamples_outdf_all_genes <- foreach::foreach(
+    g = tRNA_gene_list, .combine = 'rbind',
+    .packages = c("data.table", "dplyr", "tidyr", "purrr", "stringr")
+  ) %dopar% {
+    toc_gene <- temp_ordered_count_abun[AA_anticodon_N1 == g]
+    modtable_gene <- modtable %>% dplyr::filter(substr(AA_anticodon_N1, 1, 9) == substr(g, 1, 9))
+    compute_crosstalk_per_gene(toc_gene, modtable_gene, mutdellim = mutdellim)
+  }
+
+  parallel::stopCluster(cl)
+
+  if (nrow(allsamples_outdf_all_genes) > 0) {
+    allsamples_outdf_all_genes <- allsamples_outdf_all_genes %>%
+      dplyr::mutate(p_adjust = p.adjust(pval, method = "BH"))
+  }
+
+  saveRDS(
+    allsamples_outdf_all_genes,
+    file = file.path(
+      generated_dataframes,
+      paste0(projname, "allsamples_outdf_all_genes_cytoandmito_sample_",
+             samplenumlist[1], "_Date_", Sys.Date(), ".rds")
+    )
+  )
+}
+
+## ── 11) Done ────────────────────────────────────────────────────────────────
+
+end_time <- Sys.time()
+message("⏳ End: ", end_time, " | Duration: ", round(as.numeric(end_time - start_time), 2), " sec")

@@ -1,0 +1,285 @@
+###############################################
+# eSLAC / SinMol Crosstalk Pipeline (R)
+# Author: Mahdi Assari
+# License: MIT
+# Description:
+#   End-to-end helpers for:
+#     - environment checks
+#     - configuration & paths
+#     - reading & cleaning TSVs in parallel
+#     - tRNA read processing & charging calls
+#     - crosstalk summaries and plotting
+# Notes:
+#   - Uses data.table for speed.
+#   - Paths are Windows-friendly; prefer file.path().
+#   - Keep the “install” chunk off on clusters—use Conda/Mamba there.
+###############################################
+
+## ---- 0. Install/Load Packages (keep optional installs OFF on clusters) ----
+
+required_pkgs <- c(
+  "data.table","dplyr","tidyr","stringr","purrr",
+  "ggplot2","ggrepel","ggpubr","gridExtra","readxl",
+  "foreach","doParallel","parallel","scales","cowplot","writexl"
+)
+
+# Toggle to FALSE on HPC (install via conda/mamba instead)
+ALLOW_R_INSTALLS <- FALSE
+
+missing <- setdiff(required_pkgs, rownames(installed.packages()))
+if (length(missing) && ALLOW_R_INSTALLS) install.packages(missing)
+
+invisible(lapply(required_pkgs, require, character.only = TRUE))
+
+## ---- 1. Reproducibility & Helpers -----------------------------------------
+
+set.seed(1)
+options(stringsAsFactors = FALSE)
+`%nin%` <- Negate(`%in%`)
+
+# Print helper
+msg <- function(...) cat(format(Sys.time(), "%H:%M:%S"), "-", ..., "\n")
+
+# Safe dir create
+mk <- function(...) dir.create(file.path(...), showWarnings = FALSE, recursive = TRUE)
+
+## ---- 2. User Config --------------------------------------------------------
+
+# Samples to process (numbers inside "(N)" labels below)
+samplenumlist <- 2:2
+
+# Filtering thresholds
+mutdellim <- 5
+
+# Optional filters
+exclude_isoaccep <- c("Ile-GAT-1", "Tyr-ATA-1")
+AA_anticodon_N1_N2_ofInt <- character(0)
+AA_anticodonofInt        <- c("Arg-TCT","Asp-GTC","Glu-CTC","Glu-TTC","Lys-TTT")
+
+# Label map (edit freely)
+var1 <- "(1)Inp_noBS"
+var2 <- "(2)poly_noBS"
+var3 <- "(3)Inp_+BS"
+var4 <- "(4)poly_+BS"
+
+# Paths (prefer forward slashes on Windows or use file.path)
+base_path <- "C:/Users/mahdiassari/Box/1 UChicago ;))))))/1. Ph.D. Project/Data analysis/tsv_files"
+p_sinmol   <- file.path(base_path, "Chenyou_polysome2024_2025/sinmol")
+p_tsv      <- p_sinmol                                      # TSV lives here
+p_plots    <- file.path(p_sinmol, "plots")
+p_frames   <- file.path(p_sinmol, "generated_dataframes")
+mk(p_plots); mk(p_frames)
+
+# Reference tables
+path_modtable <- "C:/Users/mahdiassari/Box/1 UChicago ;))))))/1. Ph.D. Project/Data analysis/important ref rna modifications/tRNA/all_tRNA_seq_numbering_MA_20250122.xlsx"
+
+# Project tag
+projname <- "Chenyou_polysome2024_2025"
+
+## ---- 3. Load Reference (Modification Table) --------------------------------
+
+msg("Loading modification table…")
+modtable <- read_excel(path_modtable) |>
+  dplyr::select(1:103) |>
+  mutate(across(2:103, ~na_if(., "-"))) |>
+  mutate(across(2:103, ~na_if(., "."))) |>
+  mutate(across(2:103, ~gsub("[tU]", "T", .))) |>
+  mutate(across(2:103, ~gsub("g", "G", .))) |>
+  mutate(across(2:103, ~gsub("c", "C", .))) |>
+  mutate(AA_anticodon_N1 = AA) |>
+  tidyr::separate(AA, into = c("AA","anticodon","N1"), sep = "-", remove = TRUE) |>
+  mutate(AA_anticodon = paste(AA, anticodon, sep = "-"))
+
+## ---- 4. Index SinMol TSV files ---------------------------------------------
+
+msg("Indexing TSV files…")
+FILES <- data.frame(file_name = list.files(p_tsv)) |>
+  dplyr::filter(grepl("\\.tsv$", file_name), !grepl("unassigned", file_name)) |>
+  tidyr::extract(file_name, "(.*)\\.tsv", into = "file_name2", remove = FALSE) |>
+  tidyr::separate(
+    file_name2,
+    into = c("junk0","junk2","sample","junk3","junk4","bc","junk5","binstart","binstop"),
+    sep = "_", remove = TRUE
+  ) |>
+  dplyr::select(file_name, sample, bc, binstart, binstop) |>
+  dplyr::mutate(
+    # remap S & barcode pairs to human labels
+    sample = dplyr::case_when(
+      sample == "S5" & bc %in% c("bc5","bc10") ~ var1,
+      sample == "S5" & bc %in% c("bc8","bc9")  ~ var2,
+      sample == "S4" & bc %in% c("bc5","bc10") ~ var3,
+      sample == "S4" & bc %in% c("bc8","bc9")  ~ var4,
+      TRUE ~ sample
+    ),
+    binstart = ifelse(is.na(binstart), "-3", binstart),
+    binstop  = ifelse(is.na(binstop),  "-3", binstop)
+  ) |>
+  # keep only rows that changed to a human-readable label (dumps untouched S*)
+  dplyr::filter(!grepl("^S\\d+$", sample)) |>
+  as.data.table()
+
+## ---- 5. Read TSVs in Parallel ---------------------------------------------
+
+msg("Reading TSVs in parallel…")
+selected_cols <- c("read_id","gene","position","base","deletion","mutation","insertion")
+FILES_oneS    <- FILES[substr(sample, 2, 2) %in% samplenumlist]
+
+num_cores <- max(1, parallel::detectCores() - 2)
+cl <- parallel::makeCluster(num_cores)
+doParallel::registerDoParallel(cl)
+
+read_one <- function(row, path, keep_cols) {
+  fp <- file.path(path, row$file_name)
+  DT <- data.table::fread(fp, sep = "\t", showProgress = FALSE)
+  DT <- DT[, ..keep_cols]
+  DT[, `:=`(sample = row$sample, bc = row$bc)]
+  DT
+}
+
+t0 <- Sys.time()
+parts <- foreach::foreach(
+  row = iter(FILES_oneS, by = "row"),
+  .packages = c("data.table")
+) %dopar% read_one(row, p_tsv, selected_cols)
+
+parallel::stopCluster(cl)
+
+hg38_tRNA_SM <- data.table::rbindlist(parts)
+rm(parts); gc()
+msg("TSV load done in", round(difftime(Sys.time(), t0, units = "mins"), 2), "min.")
+
+## ---- 6. Clean & format gene IDs -------------------------------------------
+
+# Drop non‑tRNA items and reads with insertions
+hg38_tRNA_SM <- hg38_tRNA_SM[
+  gene %nin% c(
+    "NR_004394.1","NR_002716.3","NR_003925.1","NR_004430.2","NR_002756.2",
+    "NR_004391.1","NR_004392.1","NR_004393.1","NR_001571.2",
+    "Homo_sapiens_chrX.rRNA-5SR5SR","Homo_sapiens_chrX.rRNA-58S58S",
+    "Ecoli_Tyr","Yeast_Phe","Ecoli_Lys",
+    "spikein_SCC1","spikein_SCCA1","spikein_SCCA2","spikein_SCCA3"
+  ) & insertion == 0
+]
+
+# Normalize gene string:
+# 1) remove Homo_sapiens_tRNA- prefix
+# 2) if there is no "-", add one before the last 3 characters
+hg38_tRNA_SM[, gene := str_remove(gene, "^Homo_sapiens_tRNA-")]
+hg38_tRNA_SM[, gene := ifelse(!str_detect(gene, "-"),
+                              str_replace(gene, "(...$)", "-\\1"), gene)]
+
+# AA filters (optional)
+if (length(AA_anticodonofInt)) {
+  hg38_tRNA_SM <- hg38_tRNA_SM[substr(gene, 1, 7) %in% AA_anticodonofInt]
+}
+
+hg38_tRNA_SM[, source := ifelse(substr(gene, 1, 2) == "mt", "mitochondrial", "cytosolic")]
+data.table::setnames(hg38_tRNA_SM, "bc", "rep")
+
+hg38_tRNA_SM <- hg38_tRNA_SM[, .(read_id, sample, rep, source, gene, position, base, mutation, deletion)]
+hg38_tRNA_SM <- hg38_tRNA_SM[order(-position), .SD, by = read_id]
+
+# Per-read features
+hg38_tRNA_SM[, read_size_nt := .N, by = read_id]
+hg38_tRNA_SM[, top3_bases := paste0(base[1], base[2], base[3]), by = read_id]
+
+# Charging: +1 if "ACC", -1 if starts with "CCx", else NA
+hg38_tRNA_SM[, charging := data.table::fcase(
+  grepl("^CC[ATCG]$", top3_bases), -1,
+  top3_bases == "ACC", 1,
+  default = NA_real_
+)]
+hg38_tRNA_SM[, top3_bases := NULL]
+
+# Save snapshot
+saveRDS(hg38_tRNA_SM, file = file.path(
+  p_frames, sprintf("%s_hg38_tRNA_SM_cytoandmito_sample__Date_%s.rds", projname, Sys.Date())
+))
+
+## ---- 7. Build count table & merge back (minimal) ---------------------------
+
+msg("Building per-read first-position table…")
+temp_count <- hg38_tRNA_SM[order(position),
+                           .(position = first(position)),
+                           by = .(sample, rep, gene, read_id, source)]
+
+# Merge back
+temp_ordered_count <- temp_count[hg38_tRNA_SM,
+                                 on = .(sample, rep, gene, read_id, position, source)]
+
+# Split gene into parts and build helpers
+temp_ordered_count[, c("AA","anticodon","N1","N2") := tstrsplit(gene, "-", fixed = TRUE)]
+temp_ordered_count[, AA_anticodon := paste0(AA, "-", anticodon)]
+temp_ordered_count[, AA_anticodon_N1 := paste0(AA_anticodon, "-", N1)]
+if (length(AA_anticodonofInt)) {
+  temp_ordered_count <- temp_ordered_count[AA_anticodon %in% AA_anticodonofInt]
+}
+temp_ordered_count[, c("N1","N2","gene","anticodon") := NULL]
+setorder(temp_ordered_count, gene, sample, rep, position)
+
+saveRDS(
+  temp_ordered_count,
+  file.path(p_frames, sprintf("%s_temp_ordered_count_cytoandmito_%s.rds", projname, Sys.Date()))
+)
+
+## ---- 8. Charging ratio example plot (single sample) ------------------------
+
+# Example: compute charged/uncharged ratio per AA_anticodon
+msg("Computing charging ratios…")
+read_id_first <- temp_ordered_count[order(position),
+                                    .(position = first(position)),
+                                    by = .(read_id, AA_anticodon, charging, read_size_nt, sample, rep)]
+read_id_first <- read_id_first[read_size_nt >= 60]
+
+tmp_ratio <- read_id_first[charging %in% c(1, -1),
+  .(charged_read_id   = sum(charging == 1),
+    uncharged_read_id = sum(charging == -1),
+    charging_ratio    = ifelse(sum(charging == -1) > 0,
+                               sum(charging == 1) / sum(charging == -1),
+                               NA_real_)),
+  by = .(AA_anticodon, sample, rep)]
+
+# Pick a sample number string inside parentheses, e.g., "(2)"
+group1 <- "2"  # TODO: set the sample code you want to show
+
+# Arrange & color
+tmp_ratio <- tmp_ratio |>
+  dplyr::arrange(dplyr::desc(as.numeric(stringr::str_sub(sample, 2, 2))), AA_anticodon)
+
+custom_colors <- setNames("red", group1)
+custom_labels <- setNames(get(paste0("var", as.numeric(group1))), group1)
+
+p <- ggplot(tmp_ratio, aes(x = AA_anticodon, y = charging_ratio, fill = stringr::str_sub(sample, 2, 2))) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = paste0(sprintf("%.1f", charged_read_id), " charged")),
+            size = 3, vjust = -0.2, angle = 90) +
+  labs(x = "AA_anticodon", y = "charging_ratio",
+       title = paste0("Charging ratio: Sample ", group1),
+       fill = "Sample Group") +
+  theme_minimal() +
+  theme(
+    plot.background = element_rect(fill = "white", color = "white"),
+    panel.grid = element_blank(),
+    panel.grid.major.y = element_line(color = "grey90"),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 10),
+    axis.text.y = element_text(size = 12),
+    panel.border = element_rect(color = "grey80", fill = NA, linewidth = 0.5)
+  ) +
+  scale_fill_manual(values = custom_colors, labels = custom_labels)
+
+outfile <- file.path(p_plots, sprintf("tRNA_charging_ratio_S%s_%s_%s.png", group1, projname, Sys.Date()))
+ggsave(outfile, plot = p, width = 12, height = 8, dpi = 300)
+msg("Saved:", outfile)
+
+## ---- 9. (Optional) Crosstalk scaffolds ------------------------------------
+# You reference objects like `crosstalk_MA56_S2` later. Save your computed
+# crosstalk tables as RDS/Excel the same way shown below, then re-load here.
+
+# Example save:
+# saveRDS(allsamples_outdf_all_genes, file = file.path(p_frames, sprintf("%s_allsamples_outdf_all_genes_%s.rds", projname, Sys.Date())))
+# writexl::write_xlsx(allsamples_outdf_all_genes, file.path(p_frames, sprintf("%s_allsamples_outdf_all_genes_%s.xlsx", projname, Sys.Date())))
+
+## ---- 10. Session info ------------------------------------------------------
+
+msg("Done.")
+sessionInfo()
